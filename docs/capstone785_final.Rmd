@@ -1,0 +1,1084 @@
+---
+title: '785: Optimizing Mid-Campaign'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r library}
+library(vctrs)
+library(readr)
+library(lubridate)
+library(dplyr)
+library(caret)
+library(corrplot)
+library(RColorBrewer)
+library(tidyr)
+library(ggplot2)
+library(corrr)
+#library(kableExtra)
+library(e1071)
+library(randomForest)
+library(ggstance)
+library(ggformula)
+library(kernlab)
+library(pROC)
+library(FactoMineR)
+library(ggcorrplot)
+library(factoextra)
+library(glmnet)
+library(DMwR2)
+library(ggcorrplot)
+library(reshape2)
+```
+
+
+##Data import
+```{r}
+capstonedata <- read_csv("Desktop/DS 785/capstonedata.csv")
+```
+
+##Cleanse New Data ##
+Create new data set before doing any manipulation
+```{r}
+my_data <- capstonedata
+```
+
+
+
+Change data types as needed
+```{r}
+my_data <- my_data %>%
+  mutate_at(vars(new_buyer_13_months,
+                  new_buyer_13_weeks,
+                  total_exposed_buyers,
+                  impressions,
+                  clicks,
+                  cumulative_unique_users_count,
+                  aud_online_orders,
+                  audience,
+                  store_visits),
+                as.numeric)
+
+summary(my_data)
+```
+
+Remove rows where zeros make no sense
+```{r}
+my_data <- my_data[my_data$impressions != 0, ]
+my_data <- my_data[my_data$actualized_vendor_spend != 0, ]
+my_data <- my_data[my_data$roas != 0, ]
+my_data <- my_data[my_data$total_exposed_buyers != 0, ]
+```
+
+
+Remove Google Search campaigns as they are a completely different type of campaign and outside the scope of this project considering optimizations are done differently.
+And remove Multi-Vendor campaigns because they may not have the same KPI for all partners who participate.
+Remove CTV campaigns because of data pipeline break and therefore inaccurate.
+```{r}
+my_data <- subset(my_data, !grepl("Google", my_data[["flight_name"]]))
+my_data <- subset(my_data, !grepl("MV", my_data[["flight_name"]]))
+my_data <- subset(my_data, !grepl("CTV", my_data[["flight_name"]]))
+```
+
+
+Create new variables from current ones and
+Remove variables that aren't needed right now, not available mid-flight, not feasible to optimize flights against
+```{r}
+
+my_data <- my_data %>%
+    mutate(sales_lift = total_sales_lift) %>%
+    mutate(thirteen_mo_pct = `13_month_percentage`) %>%
+    mutate(thirteen_wk_pct = `13_week_percentage`) %>%
+  mutate(combined_reach = cumulative_reach_dcm_dfp+cumulative_reach_pinterest+cumulative_reach_email+cumulative_reach_paid_search+cumulative_reach_facebook_clicks+cumulative_reach_push+cumulative_reach_pinterest_clicks+cumulative_reach_targettv+cumulative_reach_tradedesk+cumulative_reach_ctv+cumulative_reach_index_exchange) %>%
+  mutate(ctr = clicks/impressions) %>%
+  mutate(influenced_sales = aud_online_sales+aud_store_sales) %>%
+  mutate(influenced_units = aud_online_units+aud_store_units) %>%
+  mutate(frequency = impressions/identified_guests) %>%
+  mutate(total_sales = online_sales+store_sales) %>%
+  mutate(total_units = online_units + store_units) %>%
+  mutate(units_per_inf_guest = total_units/total_exposed_buyers) %>%
+  mutate(inf_sales_per_guest = influenced_sales/total_exposed_buyers) %>%
+     select(-cumulative_reach_ctv,
+            -cumulative_reach_dcm_dfp,
+            -cumulative_reach_pinterest,
+            -cumulative_reach_email,
+            -cumulative_reach_paid_search,
+            -cumulative_reach_facebook_clicks,
+            -cumulative_reach_push,
+            -cumulative_reach_pinterest_clicks,
+            -cumulative_reach_targettv,
+            -cumulative_reach_tradedesk,
+            -cumulative_reach_index_exchange,
+            -actualized_vendor_spend, #not feasible to optimize against
+            -flight_revenue, #not feasible to optimize against
+            -active_view_viewability, #incomplete data
+            -cumulative_unique_users_count, #incomplete data
+            -audience, #incomplete data
+            -store_visits, #incomplete data
+            -total_sales_lift,
+            -spm, #not feasible to optimize against
+            -`13_month_percentage`,
+            -`13_week_percentage`
+            )
+
+summary(my_data)
+
+```
+
+Additional removal rows after creating variables
+```{r}
+my_data <- my_data[my_data$influenced_sales != 0, ]
+
+```
+
+
+Check for missing values in numeric variables
+```{r}
+numeric_variables <- my_data[sapply(my_data, is.numeric)]
+sum(is.na(numeric_variables))
+```
+
+Check for any infinite values in numeric variables
+```{r}
+infinite_values_all <- sapply(numeric_variables, function(col) any(is.infinite(col)))
+print(infinite_values_all)
+```
+
+
+
+
+#Correlations among predictor variables
+
+First, look at correlations among predictor variables. Have to break it into chunks because there are too many. The chosen variables together is based on domain knowledge
+
+
+Influenced Metrics (test audience sales, units, orders)
+```{r}
+#Influenced Metrics
+influenced_variables <- numeric_variables %>%
+     select(influenced_sales,
+            influenced_units,
+            aud_store_sales,
+            aud_online_sales,
+            aud_store_units,
+            aud_online_units,
+            aud_online_orders,
+            total_exposed_buyers,
+            units_per_inf_guest,
+            inf_sales_per_guest)
+
+cor_influenced <- cor(influenced_variables)
+corrplot(cor_influenced, type="upper", order="hclust",
+                      col=brewer.pal(n=8, name="RdYlBu"))
+```
+Influenced Sales, influenced online sales (aud_online_sales), influenced store sales (aud_store_sales) are strongly correlated. We will keep only the aggregated influenced sales. This is the same for units, where the aggregated will be kept.
+Influenced online orders is also highly correlated to influenced units.
+Influenced sales per guest and units per influenced guest are also highly correlated. We will only keep influenced sales per guest.
+```{r}
+#create new data frame with reduced predictor variables after correlation analysis
+my_data_red <- my_data %>%
+  select(
+         -aud_store_sales,
+         -aud_online_sales,
+         -aud_online_units,
+         -aud_store_units,
+         -aud_online_orders,
+         -units_per_inf_guest
+  )
+```
+
+
+New Buyers
+
+```{r}
+#New Buyer Metrics
+ng_variables <- numeric_variables %>%
+     select(new_buyer_13_months,
+            new_buyer_13_weeks,
+            thirteen_mo_pct,
+            thirteen_wk_pct
+            )
+
+cor_ng <- cor(ng_variables)
+corrplot(cor_ng, type="upper", order="hclust",
+                      col=brewer.pal(n=8, name="RdYlBu"))
+```
+We will keep all of the New Buyer metrics. While 13 month and 13 week are highly correlated, they tell us different stories and could provide good context.
+
+
+
+Media Metrics
+
+```{r}
+#Media Metrics
+media_variables <- numeric_variables %>%
+     select(impressions,
+            clicks,
+            combined_reach,
+            frequency,
+            ctr,
+            holistic_exposures,
+            roas,
+            identified_guests
+            )
+
+cor_media <- cor(media_variables)
+corrplot(cor_media, type="upper", order="hclust",
+         col=brewer.pal(n=8, name="RdYlBu"))
+```
+Combined Reach, Impressions, identified_guests, and holistic exposures are highly correlated. This all makes sense as they are telling the same story about how many consumers are reached through marketing efforts. We will only keep Combined Reach among these variables as this metric captures what we need and is more focused on the unique consumer than impressions.
+
+```{r}
+#remove more variables
+my_data_red <- my_data_red %>%
+  select(-impressions,
+         -holistic_exposures,
+         -identified_guests
+         )
+```
+
+
+
+
+Total Sales Metrics
+```{r}
+#Attributed Metrics
+att_variables <- numeric_variables %>%
+     select(online_orders,
+            online_sales,
+            online_units,
+            store_sales,
+            store_units,
+            total_sales,
+            total_units,
+            store_trans
+            )
+
+cor_att <- cor(att_variables)
+corrplot(cor_att, type="upper", order="hclust",
+         col=brewer.pal(n=8, name="RdYlBu"))
+```
+Similar to Influenced variables, all total sales metrics are highly correlated to one another. And like influenced variables, we will only keep  Total Sales as this captures online and store sales. Sales captures units and orders as well for this case.
+```{r}
+#remove more variables
+my_data_red <- my_data_red %>%
+  select(-online_orders,
+         -online_sales,
+         -online_units,
+         -store_sales,
+         -store_units,
+         -total_units,
+         -store_trans
+         )
+
+```
+
+
+Finally, we have done subset correlation analyses, but we have enough variables to do a full correlation analysis of predictor variables that are left
+```{r fig1, fig.width = 8, fig.height = 8}
+#Remaining numeric variables
+predictors <- my_data_red[sapply(my_data_red, is.numeric)]
+predictors <- predictors %>%
+  select(-sales_lift)
+cor_p <- cor(predictors)
+corrplot(cor_p, type="upper", order="hclust",
+         col=brewer.pal(n=8, name="RdYlBu"))
+
+```
+
+
+
+### Outliers
+
+Boxplots to check outliers
+```{r fig4, fig.width = 16, fig.height = 12}
+par(mfrow = c(3,5))
+boxplot(my_data_red$new_buyer_13_months, main = "New Buyer 13 Months", xlab = "Value")
+boxplot(my_data_red$new_buyer_13_weeks, main = "New Buyer 13 Weeks", xlab = "Value")
+boxplot(my_data_red$thirteen_mo_pct, main = "13 Mo %", xlab = "Value")
+boxplot(my_data_red$thirteen_wk_pct, main = "13 Wk %", xlab = "Value")
+boxplot(my_data_red$total_exposed_buyers, main = "Total Exposed Buyers", xlab = "Value")
+boxplot(my_data_red$clicks, main = "Clicks", xlab = "Value")
+boxplot(my_data_red$roas, main = "ROAS", xlab = "Value")
+boxplot(my_data_red$combined_reach, main = "Combined Reach", xlab = "Value")
+boxplot(my_data_red$ctr, main = "CTR", xlab = "Value")
+boxplot(my_data_red$influenced_sales, main = "Inf Sales", xlab = "Value")
+boxplot(my_data_red$influenced_units, main = "Inf Units", xlab = "Value")
+boxplot(my_data_red$frequency, main = "Frequency", xlab = "Value")
+boxplot(my_data_red$total_sales, main = "Total Sales", xlab = "Value")
+boxplot(my_data_red$inf_sales_per_guest, main = "Inf. Sales per Guest", xlab = "Value")
+boxplot(my_data_red$sales_lift, main = "Sales Lift", xlab = "Value")
+
+```
+
+Put all outliers farther than x standard deviations from that variables median into one dataframe to check how many rows and if there is anything unusual.
+With a z score threshold of 2, there are 681 outlier rows (14% of the data)
+When the z threshold is expanded to 3, which normally covers 99% of data, the number of outlier rows decreases to 419 (9% of the data).
+With z threshold of 4, there are 290 outlier rows (6% of the data)
+With z threshold of 5, there are 220 outlier rows (5% of the data)
+```{r}
+z_threshold <- 5
+outliers_NewBuyer13M <- abs(scale(my_data_red$new_buyer_13_months)) > z_threshold
+outliers_NewBuyer13W <- abs(scale(my_data_red$new_buyer_13_weeks)) > z_threshold
+outliers_TotalExposed <- abs(scale(my_data_red$total_exposed_buyers)) > z_threshold
+outliers_Clicks <- abs(scale(my_data_red$clicks)) > z_threshold
+outliers_ROAS <- abs(scale(my_data_red$roas)) > z_threshold
+outliers_Reach <- abs(scale(my_data_red$combined_reach)) > z_threshold
+outliers_CTR <- abs(scale(my_data_red$ctr)) > z_threshold
+outliers_InfSales <- abs(scale(my_data_red$influenced_sales)) > z_threshold
+outliers_InfUnits <- abs(scale(my_data_red$influenced_units)) > z_threshold
+outliers_Frequency <- abs(scale(my_data_red$frequency)) > z_threshold
+outliers_TotalSales <- abs(scale(my_data_red$total_sales)) > z_threshold
+outliers_InfSalesPerGuest <- abs(scale(my_data_red$inf_sales_per_guest)) > z_threshold
+outliers_SalesLift <- abs(scale(my_data_red$sales_lift)) > z_threshold
+
+
+combined_outliers <- outliers_NewBuyer13M | outliers_NewBuyer13W | outliers_TotalExposed | outliers_Clicks | outliers_SalesLift | outliers_CTR | outliers_InfSales | outliers_InfUnits | outliers_TotalSales | outliers_Reach | outliers_Frequency | outliers_ROAS | outliers_InfSalesPerGuest
+
+outlier_rows <- my_data_red[combined_outliers, ]
+
+print(outlier_rows)
+
+```
+
+Check on far outlier with influenced sales per guest to see if it is legit.
+This appears to be a data input error based on the type of campaign and total sales being smaller than influenced sales. We will remove this row.
+```{r}
+inf_sales_guest_outliers <- my_data_red[outliers_InfSalesPerGuest, ]
+inf_sales_guest_outliers[which.max(inf_sales_guest_outliers$inf_sales_per_guest),]
+
+```
+
+
+Check on far outliers with ROAS
+Both of the very strong outliers seem to be legit. They are high-priced electronic campaigns so spend per guest is going to be high and ROAS will also be high.
+```{r}
+my_data_red[order(my_data_red$roas, decreasing = TRUE), ]
+
+```
+
+To be more applicable, we will eliminate extreme outliers (5 or more standard deviations away from the respective variable median). Campaigns range across divisions and price points, meaning extreme outliers might be input errors OR they are true values, but not applicable to the whole and causing unnecessary skewness. This only eliminates 5% of the data.
+
+```{r}
+my_data_red <- my_data_red[!(my_data_red$flight_name %in% outlier_rows$flight_name),]
+
+```
+
+
+
+#Response Variable Exploration
+
+Look at boxplot of sales lift
+```{r}
+boxplot(my_data_red$sales_lift)
+
+```
+
+This response variable is still very skewed, but will we deal with that a bit after more exploration
+```{r}
+hist(my_data_red$sales_lift)
+summary(my_data_red$sales_lift)
+```
+Avg. Sales Lift by Account
+```{r}
+my_data_red %>%
+   group_by(account_name) %>%
+   summarize(avg_sales_lift = mean(sales_lift)) %>%
+  arrange(avg_sales_lift)
+```
+Avg. Sales Lift by Division
+```{r}
+my_data_red %>%
+   group_by(division) %>%
+   summarize(avg_sales_lift = mean(sales_lift)) %>%
+  arrange(avg_sales_lift)
+```
+
+
+Avg. Sales Lift by start month
+```{r}
+my_data_red %>%
+   group_by(month = floor_date(flight_start_date, "month")) %>%
+   summarize(avg_sales_lift = mean(sales_lift))
+```
+
+## Initial Analysis to Response Variable
+
+Now that we have removed rows with measurement errors causing outliers, let's look at the correlation to Sales Lift (response) before doing any additional transformations
+```{r}
+# Specify the target variable for which you want to calculate correlations
+target_variable <- my_data_red$sales_lift
+
+# Get the names of all numeric variables in your data frame (excluding the target variable)
+numeric_variable_names <- names(my_data_red)[sapply(my_data_red, is.numeric) & names(my_data_red) != "sales_lift"]
+
+# Create a data frame to store the correlations
+correlation_table <- data.frame(
+  Variable = character(0),
+  Correlation = numeric(0)
+)
+
+# Calculate and store the correlations
+for (variable in numeric_variable_names) {
+  correlation_value <- cor(target_variable, my_data_red[[variable]])
+  correlation_table <- rbind(correlation_table, data.frame(Variable = variable, Correlation = correlation_value))
+}
+
+# Sort the table by correlation value in descending order
+correlation_table_sorted <- correlation_table[order(correlation_table$Correlation, decreasing = TRUE), ]
+
+# Print the sorted table
+print(correlation_table_sorted)
+```
+
+Review relationships with response variable
+
+```{r fig4, fig.width = 20, fig.height = 12}
+par(mfrow = c(3,5))
+plot(my_data_red$new_buyer_13_months, my_data_red$sales_lift, main = "Sales Lift & New Buyer 13M", xlab="New Buyer 13M", ylab="Sales Lift", pch=19)
+plot(my_data_red$new_buyer_13_weeks, my_data_red$sales_lift, main = "Sales Lift & New Buyer 13W", xlab="New Buyer 13W", ylab="Sales Lift", pch=19)
+plot(my_data_red$thirteen_mo_pct, my_data_red$sales_lift, main = "Sales Lift & 13M %", xlab="13M %", ylab="Sales Lift", pch=19)
+plot(my_data_red$thirteen_wk_pct, my_data_red$sales_lift, main = "Sales Lift & 13W %", xlab="13W %", ylab="Sales Lift", pch=19)
+plot(my_data_red$total_exposed_buyers, my_data_red$sales_lift, main = "Sales Lift & Total Exposed Buyers", xlab="Exposed Buyers", ylab="Sales Lift", pch=19)
+plot(my_data_red$clicks, my_data_red$sales_lift, main = "Sales Lift & Clicks", xlab="Clicks", ylab="Sales Lift", pch=19)
+plot(my_data_red$roas, my_data_red$sales_lift, main = "Sales Lift & ROAS", xlab="ROAS", ylab="Sales Lift", pch=19)
+plot(my_data_red$combined_reach, my_data_red$sales_lift, main = "Sales Lift & Combined Reach", xlab="Combined Reach", ylab="Sales Lift", pch=19)
+plot(my_data_red$ctr, my_data_red$sales_lift, main = "Sales Lift & CTR", xlab="CTR", ylab="Sales Lift", pch=19)
+plot(my_data_red$influenced_sales, my_data_red$sales_lift, main = "Sales Lift & Influenced Sales", xlab="Influenced Sales", ylab="Sales Lift", pch=19)
+plot(my_data_red$influenced_units, my_data_red$sales_lift, main = "Sales Lift & Influenced Units", xlab="Influenced Units", ylab="Sales Lift", pch=19)
+plot(my_data_red$frequency, my_data_red$sales_lift, main = "Sales Lift & Frequency", xlab="Frequency", ylab="Sales Lift", pch=19)
+plot(my_data_red$total_sales, my_data_red$sales_lift, main = "Sales Lift & Total Sales", xlab="Total Sales", ylab="Sales Lift", pch=19)
+plot(my_data_red$inf_sales_per_guest, my_data_red$sales_lift, main = "Sales Lift & Influenced Sales per Guest", xlab="Influenced Sales per Guest", ylab="Sales Lift", pch=19)
+
+```
+
+
+##Skewness and Transformation
+
+
+```{r fig4, fig.width = 16, fig.height = 12}
+par(mfrow = c(3,5))
+hist(my_data_red$new_buyer_13_months, main = "New Buyer 13 Months", xlab = "Value")
+hist(my_data_red$new_buyer_13_weeks, main = "New Buyer 13 Weeks", xlab = "Value")
+hist(my_data_red$thirteen_mo_pct, main = "13 Mo %", xlab = "Value")
+hist(my_data_red$thirteen_wk_pct, main = "13 Wk %", xlab = "Value")
+hist(my_data_red$total_exposed_buyers, main = "Exposed Buyers", xlab = "Value")
+hist(my_data_red$clicks, main = "Clicks", xlab = "Value")
+hist(my_data_red$roas, main = "ROAS", xlab = "Value")
+hist(my_data_red$combined_reach, main = "Combined Reach", xlab = "Value")
+hist(my_data_red$ctr, main = "CTR", xlab = "Value")
+hist(my_data_red$influenced_sales, main = "Inf Sales", xlab = "Value")
+hist(my_data_red$influenced_units, main = "Inf Units", xlab = "Value")
+hist(my_data_red$frequency, main = "Frequency", xlab = "Value")
+hist(my_data_red$total_sales, main = "Total Sales", xlab = "Value")
+hist(my_data_red$inf_sales_per_guest, main = "Inf. Sales per Guest", xlab = "Value")
+hist(my_data_red$sales_lift, main = "Sales Lift", xlab = "Value")
+
+```
+
+
+Apply logarithmic transformations to the heavily skewed variables and put into new dataset
+```{r}
+variables_to_transform <- c("new_buyer_13_months", "new_buyer_13_weeks", "total_exposed_buyers", "clicks", "roas", "combined_reach", "ctr", "influenced_sales", "influenced_units", "frequency", "total_sales", "inf_sales_per_guest", "sales_lift")
+transformed_data <- my_data_red
+transformed_data[variables_to_transform] <- lapply(transformed_data[variables_to_transform], log)
+
+```
+
+
+
+
+Histogram of variables after transformation
+There is still some skewness, but not as extreme. Trying a different transformation below.
+```{r fig4, fig.width = 16, fig.height = 12}
+par(mfrow = c(3,5))
+hist(transformed_data$new_buyer_13_months, main = "New Buyer 13 Months", xlab = "Value")
+hist(transformed_data$new_buyer_13_weeks, main = "New Buyer 13 Weeks", xlab = "Value")
+hist(transformed_data$thirteen_mo_pct, main = "13 Mo %", xlab = "Value")
+hist(transformed_data$thirteen_wk_pct, main = "13 Wk %", xlab = "Value")
+hist(transformed_data$total_exposed_buyers, main = "Total Exposed Buyers", xlab = "Value")
+hist(transformed_data$clicks, main = "Clicks", xlab = "Value")
+hist(transformed_data$roas, main = "ROAS", xlab = "Value")
+hist(transformed_data$combined_reach, main = "Combined Reach", xlab = "Value")
+hist(transformed_data$ctr, main = "CTR", xlab = "Value")
+hist(transformed_data$influenced_sales, main = "Inf Sales", xlab = "Value")
+hist(transformed_data$influenced_units, main = "Inf Units", xlab = "Value")
+hist(transformed_data$frequency, main = "Frequency", xlab = "Value")
+hist(transformed_data$total_sales, main = "Total Sales", xlab = "Value")
+hist(transformed_data$inf_sales_per_guest, main = "Inf. Sales per Guest", xlab = "Value")
+hist(transformed_data$sales_lift, main = "Sales Lift", xlab = "Value")
+
+```
+
+
+Apply box-cox transformations to the heavily skewed variables and put into new dataset
+```{r}
+transformed_data_bc <- my_data_red
+
+# Function to apply Box-Cox transformation to a single variable
+boxcox_transform <- function(x) {
+  if (any(x <= 0)) {
+    return(x)  # Skip variables with non-positive values
+  }
+  boxcox_result <- BoxCoxTrans(x)
+  transformed_variable <- predict(boxcox_result, x)
+  return(transformed_variable)
+}
+
+# Apply the Box-Cox transformation to the selected variables
+for (variable_name in variables_to_transform) {
+  transformed_data_bc[[variable_name]] <- boxcox_transform(transformed_data_bc[[variable_name]])
+}
+
+```
+
+
+After BoxCox transformation
+```{r fig4, fig.width = 16, fig.height = 12}
+par(mfrow = c(3,5))
+hist(transformed_data_bc$new_buyer_13_months, main = "New Buyer 13 Months", xlab = "Value")
+hist(transformed_data_bc$new_buyer_13_weeks, main = "New Buyer 13 Weeks", xlab = "Value")
+hist(transformed_data_bc$thirteen_mo_pct, main = "13 Mo %", xlab = "Value")
+hist(transformed_data_bc$thirteen_wk_pct, main = "13 Wk %", xlab = "Value")
+hist(transformed_data_bc$total_exposed_buyers, main = "Total Exposed Buyers", xlab = "Value")
+hist(transformed_data_bc$clicks, main = "Clicks", xlab = "Value")
+hist(transformed_data_bc$roas, main = "ROAS", xlab = "Value")
+hist(transformed_data_bc$combined_reach, main = "Combined Reach", xlab = "Value")
+hist(transformed_data_bc$ctr, main = "CTR", xlab = "Value")
+hist(transformed_data_bc$influenced_sales, main = "Inf Sales", xlab = "Value")
+hist(transformed_data_bc$influenced_units, main = "Inf Units", xlab = "Value")
+hist(transformed_data_bc$frequency, main = "Frequency", xlab = "Value")
+hist(transformed_data_bc$total_sales, main = "Total Sales", xlab = "Value")
+hist(transformed_data_bc$inf_sales_per_guest, main = "Inf. Sales per Guest", xlab = "Value")
+hist(transformed_data_bc$sales_lift, main = "Sales Lift", xlab = "Value")
+
+```
+Comparing the two, it looks like Combined Reach and Influenced Units became more normalized with the BoxCox tranformation. All others were better with log. For interpretation reasons, we will leave all variables as a log transformation except for the three that benefited more from BoxCox. Sales Lift and Influenced Sales are still skewed. Below we will try a couple more ways of transformation.
+
+```{r}
+variables_to_transform_test <- c("sales_lift", "influenced_sales")
+transformed_data_test <- my_data_red
+transformed_data_test[variables_to_transform_test] <- lapply(transformed_data_test[variables_to_transform_test], sqrt)
+
+```
+
+
+```{r}
+par(mfrow = c(1,2))
+hist(transformed_data_test$sales_lift, main = "Sales Lift", xlab = "Value")
+hist(transformed_data_test$influenced_sales, main = "Inf Sales", xlab = "Value")
+```
+Square root works well for Sales Lift
+
+Cube root and exponential transformations were not successful for any variables. We will go with log for influenced sales as it got us a little closer to normal distribution.
+
+
+
+
+```{r}
+#Create final transformation data frame with both log and BoxCox transformations
+final_transformed <- my_data_red
+
+#Log transformations
+variables_to_log <- c("new_buyer_13_months", "new_buyer_13_weeks", "total_exposed_buyers", "clicks", "roas", "ctr", "influenced_sales", "frequency", "total_sales", "inf_sales_per_guest")
+final_transformed[variables_to_log] <- lapply(final_transformed[variables_to_log], log)
+
+
+
+#Box-Cox transformation to the selected variables
+variables_to_bc <- c("combined_reach", "influenced_units")
+for (variable_name in variables_to_bc) {
+  final_transformed[[variable_name]] <- boxcox_transform(final_transformed[[variable_name]])
+}
+
+#Sqrt transformation
+variables_to_sqrt <- c("sales_lift")
+final_transformed[variables_to_sqrt] <- lapply(final_transformed[variables_to_sqrt], sqrt)
+
+```
+
+
+
+
+After combination of transformations
+```{r fig4, fig.width = 16, fig.height = 12}
+par(mfrow = c(3,5))
+hist(final_transformed$new_buyer_13_months, main = "New Buyer 13 Months", xlab = "Value")
+hist(final_transformed$new_buyer_13_weeks, main = "New Buyer 13 Weeks", xlab = "Value")
+hist(final_transformed$thirteen_mo_pct, main = "13 Mo %", xlab = "Value")
+hist(final_transformed$thirteen_wk_pct, main = "13 Wk %", xlab = "Value")
+hist(final_transformed$total_exposed_buyers, main = "Total Exposed Buyers", xlab= "Value")
+hist(final_transformed$clicks, main = "Clicks", xlab = "Value")
+hist(final_transformed$roas, main = "ROAS", xlab = "Value")
+hist(final_transformed$combined_reach, main = "Combined Reach", xlab = "Value")
+hist(final_transformed$ctr, main = "CTR", xlab = "Value")
+hist(final_transformed$influenced_sales, main = "Inf Sales", xlab = "Value")
+hist(final_transformed$influenced_units, main = "Inf Units", xlab = "Value")
+hist(final_transformed$frequency, main = "Frequency", xlab = "Value")
+hist(final_transformed$total_sales, main = "Total Sales", xlab = "Value")
+hist(final_transformed$inf_sales_per_guest, main = "Inf. Sales per Guest", xlab = "Value")
+hist(final_transformed$sales_lift, main = "Sales Lift", xlab = "Value")
+
+```
+Remove dimensions
+```{r}
+final_transformed = final_transformed %>%
+    select(-account_name,
+           -division,
+           -flight_name,
+           -flight_start_date,
+           -flight_end_date)
+
+```
+
+
+
+Scale data
+```{r}
+response_variable <- final_transformed$sales_lift
+final_transformed <- as.data.frame(scale(final_transformed[, -which(names(final_transformed) == "sales_lift")]))
+final_transformed <- cbind(sales_lift = response_variable, final_transformed)
+
+```
+
+
+
+Review relationships with response variable after transformations
+
+```{r fig4, fig.width = 20, fig.height = 12}
+par(mfrow = c(3,5))
+plot(final_transformed$new_buyer_13_months, final_transformed$sales_lift, main = "Sales Lift & New Buyer 13M", xlab="New Buyer 13M", ylab="Sales Lift", pch=19)
+plot(final_transformed$new_buyer_13_weeks, final_transformed$sales_lift, main = "Sales Lift & New Buyer 13W", xlab="New Buyer 13W", ylab="Sales Lift", pch=19)
+plot(final_transformed$thirteen_mo_pct, final_transformed$sales_lift, main = "Sales Lift & 13M %", xlab="13M %", ylab="Sales Lift", pch=19)
+plot(final_transformed$thirteen_wk_pct, final_transformed$sales_lift, main = "Sales Lift & 13W %", xlab="13W %", ylab="Sales Lift", pch=19)
+plot(final_transformed$total_exposed_buyers, final_transformed$sales_lift, main = "Sales Lift & Total Exposed Buyers", xlab="Tot Exposed Buyers", ylab="Sales Lift", pch=19)
+plot(final_transformed$clicks, final_transformed$sales_lift, main = "Sales Lift & Clicks", xlab="Clicks", ylab="Sales Lift", pch=19)
+plot(final_transformed$roas, final_transformed$sales_lift, main = "Sales Lift & ROAS", xlab="ROAS", ylab="Sales Lift", pch=19)
+plot(final_transformed$combined_reach, final_transformed$sales_lift, main = "Sales Lift & Combined Reach", xlab="Combined Reach", ylab="Sales Lift", pch=19)
+plot(final_transformed$ctr, final_transformed$sales_lift, main = "Sales Lift & CTR", xlab="CTR", ylab="Sales Lift", pch=19)
+plot(final_transformed$influenced_sales, final_transformed$sales_lift, main = "Sales Lift & Influenced Sales", xlab="Influenced Sales", ylab="Sales Lift", pch=19)
+plot(final_transformed$influenced_units, final_transformed$sales_lift, main = "Sales Lift & Influenced Units", xlab="Influenced Units", ylab="Sales Lift", pch=19)
+plot(final_transformed$frequency, final_transformed$sales_lift, main = "Sales Lift & Frequency", xlab="Frequency", ylab="Sales Lift", pch=19)
+plot(final_transformed$total_sales, final_transformed$sales_lift, main = "Sales Lift & Total Sales", xlab="Total Sales", ylab="Sales Lift", pch=19)
+plot(final_transformed$inf_sales_per_guest, final_transformed$sales_lift, main = "Sales Lift & Influenced Sales per Guest", xlab="Influenced Sales per Guest", ylab="Sales Lift", pch=19)
+
+```
+
+
+
+##Start building models
+
+```{r}
+dataused_t <- final_transformed
+
+```
+
+
+
+RMSE Baseline model for comparison
+```{r}
+y <- dataused_t$sales_lift
+mean_model <- rep(mean(y), length(y))
+baseline_mae <- mean(abs(y - mean_model))
+baseline_mae
+```
+baseline r squared & rmse
+```{r}
+baseline_rsquared <- 1 - sum((y - mean_model)^2) / sum((y - mean(y))^2)
+baseline_rmse <- sqrt(mean((y - mean_model)^2))
+```
+
+Using cross-validation, build multiple linear regression model to predict Sales Lift
+```{r}
+set.seed(88)
+training = trainControl(method = "cv", number = 10)
+ 
+#multiple linear regression with all predictors
+fit_lm_full = train(sales_lift ~ .,
+                     data = dataused_t,
+                     method = "lm",
+                     trControl = training)
+ 
+fit_lm_full$results$MAE
+
+```
+
+
+Fit LASSO model with full feature set and a range of lambda values
+```{r}
+alllambda = seq(0, 0.01, by = 0.001)
+fit_LASSO = train(sales_lift ~ . ,
+                       data = dataused_t,
+                       method = "glmnet",
+                       trControl = training,
+                       tuneGrid = expand.grid(alpha=c(1),lambda=alllambda))
+ 
+
+fit_LASSO
+
+```
+
+Ridge regression
+```{r}
+alllambda = seq(0, 0.01, by = 0.001)
+fit_ridge = train(sales_lift ~ . ,
+                       data = dataused_t,
+                       method = "glmnet",
+                       trControl = training,
+                       tuneGrid = expand.grid(alpha=0,lambda=alllambda))
+ 
+
+fit_ridge
+
+```
+
+Elastic Net
+```{r}
+alllambda = seq(0, 0.01, by = 0.001)
+fit_elasticnet = train(sales_lift ~ . ,
+                       data = dataused_t,
+                       method = "glmnet",
+                       trControl = training,
+                       preProcess = c("center", "scale"),
+                       tuneGrid = expand.grid(alpha= seq(0,1, by = 0.1), lambda=alllambda))
+ 
+
+fit_elasticnet
+
+```
+
+Recursive Feature Elimination
+```{r}
+ctrl <- rfeControl(functions = lmFuncs, method = "cv", number = 10)
+fit_rfe <- train(sales_lift ~ .,
+                 data = dataused_t,
+                 method= "glmnet",
+                 sizes = c(1:4), #range of features to consider
+                 rfeControl = ctrl
+                 )
+
+fit_rfe
+        
+```
+
+
+Decision Tree
+
+```{r}
+fit_dtree = train(sales_lift ~ .,
+                       data = dataused_t,
+                       method = "rpart",
+                       trControl = training,
+                      na.action = na.exclude,
+                       tuneGrid = expand.grid(cp = seq(0, .02, by = .001)))
+
+fit_dtree
+```
+
+
+Random Forest
+```{r}
+
+fit_rf = train(sales_lift ~ .,
+               data = dataused_t,
+               method ="rf",
+               tuneGrid = expand.grid(mtry = c(2, 3, 4, 5, 6)), #start at square root of number of predictors (3.7)
+               trControl = training
+               )
+
+fit_rf
+
+```
+
+
+
+
+Gradient Boosting
+```{r}
+tune_grid <- expand.grid(
+  nrounds = seq(from = 1, to = 20, by = 1),
+  eta= c(0.0002, 0.0005, .0008, .001, .002),
+  max_depth = c(1, 2, 3, 4, 5),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+fit_gb = train(sales_lift ~ .,
+                       data = dataused_t,
+                       method = "xgbTree",
+                       trControl = training,
+                      tuneGrid = tune_grid,
+                      verbosity = 0)
+
+fit_gb
+```
+
+
+
+##Evaluate Models
+
+Get best models based on tuning parameters and fine the one with the lowest RMSE
+```{r}
+############# identify selected model to fit to full data #############
+# all best models
+all_best_Types = c("Baseline", "Linear","LASSO", "Ridge_Regression", "Elastic_Net", "RFE", "DTree", "Random_Forest", "GBoost")
+all_best_Pars = list(3,14,fit_LASSO$bestTune,fit_ridge$bestTune, fit_elasticnet$bestTune, fit_rfe$bestTune, fit_dtree$bestTune, fit_rf$bestTune, fit_gb$bestTune)
+all_best_Models = list(baseline_mae,
+                        fit_lm_full$finalModel,
+                        fit_LASSO$finalModel,
+                        fit_ridge$finalModel,
+                        fit_elasticnet$finalModel,
+                        fit_rfe$finalModel,
+                       fit_dtree$finalModel,
+                       fit_rf$finalModel,
+                       fit_gb$finalModel)
+all_best_MAE = c(baseline_mae,
+                  fit_lm_full$results$MAE,
+                   min(fit_LASSO$results$MAE),
+                   min(fit_ridge$results$MAE),
+                   min(fit_elasticnet$results$MAE),
+                   min(fit_rfe$results$MAE),
+                   min(fit_dtree$results$MAE),
+                   min(fit_rf$results$MAE),
+                   min(fit_gb$results$MAE))
+
+ 
+one_best_Type = all_best_Types[which.min(all_best_MAE)]
+one_best_Pars = all_best_Pars[which.min(all_best_MAE)]
+one_best_Model = all_best_Models[[which.min(all_best_MAE)]]
+
+one_best_Type
+
+```
+
+
+
+
+More metrics for evaluation
+```{r}
+#rsquared
+all_best_Rsquared = c(baseline_rsquared,
+                  fit_lm_full$results$Rsquared,
+                   max(fit_LASSO$results$Rsquared),
+                   max(fit_ridge$results$Rsquared),
+                   max(fit_elasticnet$results$Rsquared),
+                   max(fit_rfe$results$Rsquared),
+                   max(fit_dtree$results$Rsquared),
+                   max(fit_rf$results$Rsquared),
+                   max(fit_gb$results$Rsquared))
+
+#rmse
+all_best_RMSE = c(baseline_rmse,
+                  fit_lm_full$results$RMSE,
+                   min(fit_LASSO$results$RMSE),
+                   min(fit_ridge$results$RMSE),
+                   min(fit_elasticnet$results$RMSE),
+                   min(fit_rfe$results$RMSE),
+                   min(fit_dtree$results$RMSE),
+                   min(fit_rf$results$RMSE),
+                   min(fit_gb$results$RMSE))
+
+```
+
+
+
+Combined Results
+```{r}
+model_results = data.frame(all_best_Types, all_best_MAE, all_best_RMSE, all_best_Rsquared)
+model_results
+```
+
+```{r}
+one_best_Pars
+
+```
+
+
+##Best Model graphs
+```{r}
+predictions <- predict(fit_rf, newdata = dataused_t)
+combined_data <- cbind(dataused_t$sales_lift^2, predictions^2) #squared because we took the square root for normalization, this puts it back to normal
+colnames(combined_data) <- c("Actual", "Predicted")
+head(combined_data)
+```
+
+Scatterplot of predicted vs actual values
+```{r}
+point_type <- rep(c("Actual", "Predicted"), each = nrow(combined_data)/2)
+colors <- ifelse(point_type == "Actual", "blue", "red")
+plot(dataused_t$sales_lift^2, predictions^2, 
+     main = "Scatterplot of RF: Predicted vs. Actual", 
+     xlab = "Actual Values", ylab = "Predicted Values", 
+     pch = 16, col = colors)
+legend("bottomright", legend = unique(point_type), col = c("blue", "red"), pch = 16)
+```
+
+```{r}
+value_range <- range(c(dataused_t$sales_lift^2, predictions^2))
+# Create a scatterplot of actual vs predicted
+plot(dataused_t$sales_lift^2, predictions^2, 
+     main = "Scatterplot of Actual vs. Predicted Values",
+     xlab = "Actual Values", ylab = "Predicted Values", 
+     pch = 16, col = "blue",
+     xlim = value_range, ylim = value_range)
+
+```
+
+
+Residual plot
+```{r}
+residuals <- dataused_t$sales_lift^2 - predictions^2
+head(residuals)
+```
+
+```{r}
+plot(predictions^2, residuals,
+     main = "Random Forest Residual Plot",
+     xlab = "Predicted Values", ylab="Residuals",
+     pch = 16, col ="blue",
+     ylim = c(-max(abs(residuals)), max(abs(residuals))))
+
+abline(h = 0, col = "red", lty = 1)
+```
+
+
+
+```{r}
+plot(fit_rf$finalModel,
+     main = "Random Forest Number of Trees")
+```
+
+Exact number of trees
+```{r}
+fit_rf$finalModel
+```
+
+MAE but in-context and needs squared because of transformation to sales lift
+```{r}
+
+rf_mae_sq <- (min(fit_rf$results$MAE)^2)*100
+rf_mae_sq
+```
+
+```{r}
+base_mae_sq <- (baseline_mae^2)*100
+base_mae_sq
+```
+
+t test between rf mae and baseline mae
+```{r}
+t.test(c(rf_mae_sq, base_mae_sq))
+
+```
+
+```{r}
+importance = importance(fit_rf$finalModel)
+varImpPlot(fit_rf$finalModel,
+           main = "Variable Importance of RF Model")
+```
+
+```{r}
+imp_table <- varImp(fit_rf$finalModel)
+imp_table
+```
+
+```{r fig4, fig.width = 12, fig.height = 8}
+imp = data.frame(Variable = rownames(importance),
+                 IncNodePurity = importance)
+imp %>%
+  mutate(Variable = reorder(Variable, -IncNodePurity)) %>%
+  gf_col(IncNodePurity ~ Variable, fill = "navy") +
+  labs(title = "Variable Importance",
+       x = "Predictor Variable",
+       y = "IncNodePurity") +
+  theme(text = element_text(size = 16),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+my_data_red %>%
+  gf_point(sales_lift ~ thirteen_wk_pct) %>%
+  gf_smooth(sales_lift ~ thirteen_wk_pct) %>%
+  gf_labs(title = "Relationship of Sales Lift & % of New Guests: 13 Weeks",
+          y= "Sales Lift",
+          x = "% of New Guests: 13 Weeks")
+my_data_red %>%
+  gf_point(sales_lift ~ thirteen_mo_pct) %>%
+  gf_smooth(sales_lift ~ thirteen_mo_pct) %>%
+   gf_labs(title = "Relationship of Sales Lift & % of New Guests: 13 Months",
+          y= "Sales Lift",
+          x = "% of New Guests: 13 Months")
+
+```
+
+
+```{r}
+my_data_red %>%
+  gf_point(sales_lift ~ roas) %>%
+  gf_smooth(sales_lift ~ roas) %>%
+   gf_labs(title = "Relationship of Sales Lift & ROAS",
+          y= "Sales Lift",
+          x = "ROAS")
+
+```
+```{r}
+ng_sl <- my_data_red %>%
+  select(
+        thirteen_wk_pct,
+         thirteen_mo_pct,
+         roas,
+        sales_lift)
+# Compute correlation matrix
+cor_matrix <- cor(ng_sl, 
+                    use = "pairwise.complete.obs")
+cor_sales_lift <- cor_matrix["sales_lift", ]
+```
+
+```{r fig4, fig.width = 8, fig.height = 5}
+ggplot(data = data.frame(variable = names(cor_sales_lift), correlation = cor_sales_lift),
+       aes(x = reorder(variable, -correlation), y = "sales_lift", fill = correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "#E46726", mid = "white", high = "#6D9EC1", midpoint = 0) +
+  theme_minimal() +
+  theme(text = element_text(size = 14),
+        axis.text.y = element_blank(),  # Remove y-axis labels
+        legend.position = "none") +  # Remove the legend
+  geom_text(aes(label = sprintf("%.2f", correlation)), vjust = 1.5, color = "black") +
+  labs(title = "Correlation with Sales Lift",
+       y = "Sales Lift",
+       x = "RF Important Variables")
+
+```
+
+
+Correlations by division for important variables
+```{r}
+cor_by_division <- by(my_data_red, my_data_red$division, function(sub_data) {
+  cor(sub_data[, c("sales_lift", "thirteen_mo_pct", "thirteen_wk_pct", "roas")])
+})
+cor_division_df <- do.call(rbind, lapply(names(cor_by_division), function(division) {
+  cor_matrix_div <- cor_by_division[[division]]
+  data.frame(Division = division, as.table(cor_matrix_div))
+}))
+cor_division_df_filtered <- cor_division_df[cor_division_df$Var2 == "sales_lift", ]
+
+cor_division_df_filtered <- cor_division_df_filtered[cor_division_df_filtered$Var1 != "sales_lift", ]
+
+cor_division_df_filtered
+```
+
+```{r}
+
+pivot_table <- dcast(cor_division_df_filtered, Division ~ Var1, value.var = "Freq")
+pivot_table
+```
+
+  
+
